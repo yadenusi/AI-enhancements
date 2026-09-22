@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Predictive Maintenance for EC2 fleets. Provisions the S3 data lake, the
+  Lambda orchestrator, the SNS alert topic, the EventBridge schedule, and
+  the IAM roles used by the SageMaker endpoint and SSM Automation runbook.
+
+Parameters:
+  SageMakerEndpointName:
+    Type: String
+    Default: predictive-maintenance-endpoint
+  WarnThreshold:
+    Type: Number
+    Default: 0.4
+  ActThreshold:
+    Type: Number
+    Default: 0.75
+  OnCallEmail:
+    Type: String
+    Description: Email address subscribed to the SNS alert topic
+
+Resources:
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "predictive-maintenance-${AWS::AccountId}-${AWS::Region}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawAfter90Days
+            Prefix: raw/
+            Status: Enabled
+            ExpirationInDays: 90
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: predictive-maintenance-alerts
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref OnCallEmail
+
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PredictiveMaintenanceOrchestratorRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrchestratorPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - ec2:DescribeInstances
+                  - sagemaker-runtime:InvokeEndpoint
+                  - sns:Publish
+                  - ssm:StartAutomationExecution
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: predictive-maintenance-orchestrator
+      Runtime: python3.12
+      Handler: lambda_orchestrator.handler
+      Role: !GetAtt OrchestratorRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENDPOINT_NAME: !Ref SageMakerEndpointName
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          SSM_DOCUMENT_NAME: !Ref RemediationRunbook
+          WARN_THRESHOLD: !Ref WarnThreshold
+          ACT_THRESHOLD: !Ref ActThreshold
+          INSTANCE_TAG_KEY: predictive-maintenance
+          INSTANCE_TAG_VALUE: enabled
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # Placeholder inline code. Deploy src/lambda/lambda_orchestrator.py
+              # via the packaging step described in README.md before use.
+              return {"statusCode": 200, "body": "replace with packaged deployment"}
+
+  SchedulerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: predictive-maintenance-schedule
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrchestratorFunction.Arn
+          Id: OrchestratorTarget
+
+  SchedulerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SchedulerRule.Arn
+
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PredictiveMaintenanceAutomationRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AutomationPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:CreateSnapshot
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeInstances
+                  - ec2:TerminateInstances
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DeregisterTargets
+                Resource: "*"
+
+  RemediationRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Name: predictive-maintenance-remediation
+      Content: !Sub |
+        # Content trimmed for inline template use.
+        # Deploy automation/ssm_remediation_runbook.yaml as the document body.
+        schemaVersion: "0.3"
+        assumeRole: "${AutomationRole.Arn}"
+        mainSteps: []
+
+Outputs:
+  DataLakeBucketName:
+    Value: !Ref DataLakeBucket
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  OrchestratorFunctionName:
+    Value: !Ref OrchestratorFunction

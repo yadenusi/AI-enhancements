@@ -1,0 +1,95 @@
+description: |
+  Pre-emptive remediation runbook for instances flagged by the predictive
+  maintenance model. Snapshots attached EBS volumes for forensic recovery,
+  deregisters the instance from its target group so traffic drains
+  gracefully, and terminates the instance so its Auto Scaling group
+  launches a healthy replacement before the predicted failure occurs.
+schemaVersion: "0.3"
+assumeRole: "{{ AutomationAssumeRole }}"
+parameters:
+  InstanceId:
+    type: String
+    description: EC2 instance id flagged by the predictive maintenance model
+  FailureProbability:
+    type: String
+    description: Model output used for the audit trail
+  AutomationAssumeRole:
+    type: String
+    default: "arn:aws:iam::ACCOUNT_ID:role/PredictiveMaintenanceAutomationRole"
+mainSteps:
+  - name: TagInstanceForAudit
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: CreateTags
+      Resources:
+        - "{{ InstanceId }}"
+      Tags:
+        - Key: predictive-maintenance-flagged
+          Value: "true"
+        - Key: predictive-maintenance-probability
+          Value: "{{ FailureProbability }}"
+    nextStep: SnapshotVolumes
+
+  - name: SnapshotVolumes
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: snapshot_volumes
+      InputPayload:
+        instance_id: "{{ InstanceId }}"
+      Script: |
+        import boto3
+
+        def snapshot_volumes(events, context):
+            ec2 = boto3.client("ec2")
+            instance_id = events["instance_id"]
+            volumes = ec2.describe_volumes(
+                Filters=[{"Name": "attachment.instance-id", "Values": [instance_id]}]
+            )["Volumes"]
+            snapshot_ids = []
+            for volume in volumes:
+                snap = ec2.create_snapshot(
+                    VolumeId=volume["VolumeId"],
+                    Description=f"Pre-emptive snapshot before replacing {instance_id}",
+                )
+                snapshot_ids.append(snap["SnapshotId"])
+            return {"snapshot_ids": snapshot_ids}
+    outputs:
+      - Name: SnapshotIds
+        Selector: $.Payload.snapshot_ids
+        Type: StringList
+    nextStep: DeregisterFromTargetGroup
+
+  - name: DeregisterFromTargetGroup
+    action: aws:executeScript
+    inputs:
+      Runtime: python3.11
+      Handler: drain_instance
+      InputPayload:
+        instance_id: "{{ InstanceId }}"
+      Script: |
+        import boto3
+
+        def drain_instance(events, context):
+            elbv2 = boto3.client("elbv2")
+            instance_id = events["instance_id"]
+            target_groups = elbv2.describe_target_groups()["TargetGroups"]
+            for tg in target_groups:
+                health = elbv2.describe_target_health(TargetGroupArn=tg["TargetGroupArn"])
+                for target in health["TargetHealthDescriptions"]:
+                    if target["Target"]["Id"] == instance_id:
+                        elbv2.deregister_targets(
+                            TargetGroupArn=tg["TargetGroupArn"],
+                            Targets=[{"Id": instance_id}],
+                        )
+            return {"status": "drained"}
+    nextStep: TerminateInstance
+
+  - name: TerminateInstance
+    action: aws:changeInstanceState
+    inputs:
+      InstanceIds:
+        - "{{ InstanceId }}"
+      DesiredState: terminated
+    isEnd: true
